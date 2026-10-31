@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# agentcell — запускает Claude Code в Docker так, что агент работает в одной папке:
+# в той, откуда вы вызвали команду. Устройство описано в docs/ARCHITECTURE.md.
+#
+# Перейдите в папку проекта и выполните:
+#   agentcell                 интерактивная сессия
+#   agentcell -p "задача"     одна задача без диалога (подходит для cron)
+#   agentcell --shell         bash внутри контейнера (настроить git, посмотреть, что внутри)
+#   agentcell <флаги>         всё остальное уходит в claude как есть
+#
+# Настройки через переменные окружения:
+#   AGENTCELL_IMAGE           имя Docker-образа (по умолчанию agentcell)
+#   AGENTCELL_STATE           папка хранилища на хосте (по умолчанию ~/.config/agentcell/state)
+#   AGENTCELL_ALLOW_ANY_DIR=1 разрешить запуск из домашней папки и из корня (/)
+set -euo pipefail
+
+IMAGE="${AGENTCELL_IMAGE:-agentcell}"
+STATE_DIR="${AGENTCELL_STATE:-$HOME/.config/agentcell/state}"
+
+# Пути внутри контейнера. Больше на хосте ничего контейнеру не видно.
+CELL_WORKDIR="/workspace"   # сюда монтируется проект
+CELL_HOME="/home/agent"     # сюда монтируется хранилище (вход в аккаунт, настройки)
+
+die() {
+    echo "ERROR: $1" >&2
+    exit 1
+}
+
+# --- Проверки перед запуском -------------------------------------------------
+
+if ! docker info >/dev/null 2>&1; then
+    if [ "$(uname -s)" = "Darwin" ]; then
+        die "Docker is not available. Start it with: colima start"
+    else
+        die "Docker is not available. Check that the daemon is running and your user is in the 'docker' group."
+    fi
+fi
+
+docker image inspect "$IMAGE" >/dev/null 2>&1 \
+    || die "Image '$IMAGE' not found. Run scripts/install.sh from the repository first."
+
+# Главный риск идеи «виден только проект» — запуск не из той папки. Из домашней
+# папки или из корня контейнер увидел бы почти всё, поэтому по умолчанию отказываем.
+PROJECT_DIR="$(pwd -P)"
+HOME_DIR="$(cd "$HOME" && pwd -P)"
+if [ "${AGENTCELL_ALLOW_ANY_DIR:-0}" != "1" ]; then
+    if [ "$PROJECT_DIR" = "/" ] || [ "$PROJECT_DIR" = "$HOME_DIR" ]; then
+        die "Refusing to mount '$PROJECT_DIR': it is too wide. cd into a project folder or set AGENTCELL_ALLOW_ANY_DIR=1."
+    fi
+fi
+
+# --- Сборка команды docker run -----------------------------------------------
+
+# Папка хранилища хранит токен входа, поэтому закрываем её от других пользователей.
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR" 2>/dev/null || true
+
+# Базовые флаги:
+#   --rm     после выхода контейнер пропадает, а данные остаются только в хранилище
+#   --init   не даёт копиться «зависшим» дочерним процессам в долгих запусках
+DOCKER_ARGS=(run --rm --init)
+
+# Терминал подключаем только если он есть (иначе запуск из cron или пайпа упадёт).
+if [ -t 0 ] && [ -t 1 ]; then
+    DOCKER_ARGS+=(-it)
+else
+    DOCKER_ARGS+=(-i)
+fi
+
+# Ограничения контейнера:
+#   --user                    процесс работает от вашего пользователя, не от root
+#   --cap-drop=ALL            у процесса нет дополнительных прав Linux
+#   --security-opt ...        процесс не может получить прав больше, чем у него есть
+#   -v (два раза)             контейнер видит только эти две папки вашего компьютера
+DOCKER_ARGS+=(
+    --user "$(id -u):$(id -g)"
+    --cap-drop=ALL
+    --security-opt no-new-privileges
+    -v "$STATE_DIR:$CELL_HOME"
+    -v "$PROJECT_DIR:$CELL_WORKDIR" -w "$CELL_WORKDIR"
+    -e "HOME=$CELL_HOME"
+)
+
+# API-ключ передаём по имени переменной: значение не попадает ни в аргументы
+# команды, ни в образ.
+if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+    DOCKER_ARGS+=(-e ANTHROPIC_API_KEY)
+fi
+
+# Режим --shell: вместо claude запускаем bash в том же контейнере.
+if [ "${1:-}" = "--shell" ]; then
+    shift
+    DOCKER_ARGS+=(--entrypoint bash)
+fi
+
+exec docker "${DOCKER_ARGS[@]}" "$IMAGE" "$@"
