@@ -8,57 +8,726 @@
 #   agentcell --shell         bash внутри контейнера (настроить git, посмотреть, что внутри)
 #   agentcell <флаги>         всё остальное уходит в claude как есть
 #
+# Только macOS — управление собственной VM Colima (профиль agentcell):
+#   agentcell --vm-status     состояние VM, папки из конфига, сессии в VM и плагины
+#   agentcell --vm-stop       остановить VM (освободить память); следующий запуск поднимет её сам
+#   agentcell --vm-apply      создать VM или применить изменённый конфиг (VM перезапускается)
+#
 # Настройки через переменные окружения:
-#   AGENTCELL_IMAGE           имя Docker-образа (по умолчанию agentcell)
-#   AGENTCELL_STATE           папка хранилища на хосте (по умолчанию ~/.config/agentcell/state)
-#   AGENTCELL_ALLOW_ANY_DIR=1 разрешить запуск из домашней папки и из корня (/)
+#   AGENTCELL_IMAGE            имя Docker-образа (по умолчанию agentcell)
+#   AGENTCELL_STATE            папка хранилища на хосте (по умолчанию ~/.config/agentcell/state)
+#   AGENTCELL_ALLOW_ANY_DIR=1  только Linux: разрешить запуск из домашней папки и из корня (/)
+#
+# Плагины (необязательно): ставятся командой scripts/install.sh --with <имя> и включаются
+# в сессии своими переменными AGENTCELL_<ПЛАГИН>_* (например, AGENTCELL_KIND_CLUSTER).
+# Описание: docs/PLUGINS.md.
+#
+# На macOS папки проектов и ресурсы VM задаются в ~/.config/agentcell/config
+# (шаблон создаёт scripts/install.sh).
 set -euo pipefail
 
+OS="$(uname -s)"
 IMAGE="${AGENTCELL_IMAGE:-agentcell}"
-STATE_DIR="${AGENTCELL_STATE:-$HOME/.config/agentcell/state}"
+CONFIG_DIR="$HOME/.config/agentcell"
+STATE_DIR="${AGENTCELL_STATE:-$CONFIG_DIR/state}"
+PLUGINS_DIR="$CONFIG_DIR/plugins"   # установленные плагины (см. раздел «Плагины»)
+PLUGIN_NAMES=""                     # имена загруженных плагинов через пробел
 
 # Пути внутри контейнера. Больше на хосте ничего контейнеру не видно.
 CELL_WORKDIR="/workspace"   # сюда монтируется проект
 CELL_HOME="/home/agent"     # сюда монтируется хранилище (вход в аккаунт, настройки)
 
+# --- Только macOS: собственная VM Colima ---------------------------------------
+
+VM_PROFILE="agentcell"                     # имя профиля Colima
+DOCKER_CONTEXT_NAME="colima-$VM_PROFILE"   # docker-контекст, который Colima создаёт для профиля
+CONFIG_FILE="$CONFIG_DIR/config"           # конфиг: папки проектов и ресурсы VM
+VM_APPLIED_FILE="$CONFIG_DIR/vm-applied"   # с какими настройками VM запущена последний раз
+VM_LOCK_DIR="$CONFIG_DIR/vm.lock"          # замок на время старта VM (см. vm_lock)
+
+# Папки домашнего каталога, которые никогда не должны попасть в VM: ключи, доступы к
+# кластерам и облакам, настройки Docker и самих VM. Library есть в домашней папке любого
+# Мака, по ней же скрипт проверяет, что домашняя папка в VM не видна.
+SENSITIVE_NAMES=".ssh .kube .aws .gnupg .docker .config .colima .lima Library"
+
+# Значения из конфига (заполняет load_config). Здесь — значения по умолчанию.
+PROJECT_DIRS=()        # папки, которые видит VM
+PROJECT_DIR_COUNT=0    # их число (пустой массив в bash 3.2 при set -u разворачивать нельзя)
+VM_CPU=4               # процессоров у VM
+VM_MEMORY=6            # памяти у VM, ГиБ
+VM_DISK=60             # диск VM, ГиБ (можно только увеличивать)
+BLOCK_HOST_ACCESS=0    # 1 — закрыть контейнерам доступ к сервисам на localhost Мака
+
+# --- Общие функции ---------------------------------------------------------------
+
+# Печатает ошибку и завершает работу. Первый аргумент — суть ошибки, остальные —
+# дополнительные строки (например, готовые команды).
 die() {
     echo "ERROR: $1" >&2
+    shift
+    local line
+    for line in "$@"; do
+        echo "       $line" >&2
+    done
     exit 1
+}
+
+# Сообщения скрипта идут в stderr, чтобы не смешиваться с ответом claude в режиме -p.
+info() {
+    echo "INFO: $1" >&2
+}
+
+warn() {
+    echo "WARN: $1" >&2
+}
+
+is_mac() {
+    [ "$OS" = "Darwin" ]
+}
+
+# Все вызовы docker идут через эту функцию: на macOS — в VM agentcell (ваш текущий
+# docker-контекст не используется и не меняется), на Linux — в обычный docker.
+dkr() {
+    if is_mac; then
+        docker --context "$DOCKER_CONTEXT_NAME" "$@"
+    else
+        docker "$@"
+    fi
+}
+
+# Печатает настоящий путь папки (без символических ссылок) или пустую строку,
+# если папки нет.
+real_dir() {
+    (cd "$1" 2>/dev/null && pwd -P) || true
+}
+
+# Успех, если путь $1 совпадает с $2 или лежит внутри него.
+# Слеш в конце нужен, чтобы /src-old не считалась частью /src.
+is_inside() {
+    case "$1/" in
+        "$2"/*) return 0 ;;
+    esac
+    return 1
+}
+
+# Путь в нижнем регистре. Файловая система Мака по умолчанию не различает регистр
+# (~/.SSH — та же папка, что и ~/.ssh), поэтому «секретные» папки сравниваем без учёта регистра.
+lower() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+# То же, что is_inside, но без учёта регистра.
+is_inside_nocase() {
+    is_inside "$(lower "$1")" "$(lower "$2")"
+}
+
+# Успех, если папки пересекаются так, как это понимает Colima: она сравнивает пути как
+# обычные строки, поэтому ~/src и ~/src2 для неё пересекаются, хотя это разные папки.
+mounts_overlap() {
+    case "$1" in
+        "$2"*) return 0 ;;
+    esac
+    case "$2" in
+        "$1"*) return 0 ;;
+    esac
+    return 1
+}
+
+# --- Конфиг (macOS) ----------------------------------------------------------------
+
+# Проверяет папку, которая будет смонтирована в VM: она не должна быть слишком
+# широкой и не должна содержать секреты домашней папки.
+check_vm_mount() {
+    local dir="$1" name
+    if [ "$dir" = "/" ] || [ "$dir" = "$HOME_PARENT" ] || [ "$dir" = "$HOME_DIR" ]; then
+        die "Folder '$dir' is too wide to be mounted into the agentcell VM."
+    fi
+    for name in $SENSITIVE_NAMES; do
+        if is_inside_nocase "$HOME_DIR/$name" "$dir"; then
+            die "Folder '$dir' is or contains '$HOME_DIR/$name', which must never be mounted into the VM."
+        fi
+    done
+}
+
+# Папка проекта дополнительно не должна лежать внутри секретных папок.
+check_project_dir() {
+    local dir="$1" name
+    check_vm_mount "$dir"
+    for name in $SENSITIVE_NAMES; do
+        if is_inside_nocase "$dir" "$HOME_DIR/$name"; then
+            die "PROJECT_DIR '$dir' is inside '$HOME_DIR/$name', which must never be mounted into the VM."
+        fi
+    done
+}
+
+# Папки из конфига и хранилище не должны пересекаться: Colima такой набор не примет.
+check_no_overlap() {
+    local all=("${PROJECT_DIRS[@]}" "$STATE_REAL")
+    local count=${#all[@]} i j
+    i=0
+    while [ "$i" -lt "$count" ]; do
+        j=$((i + 1))
+        while [ "$j" -lt "$count" ]; do
+            if mounts_overlap "${all[$i]}" "${all[$j]}"; then
+                die "Folders '${all[$i]}' and '${all[$j]}' overlap, and Colima does not allow overlapping mounts." \
+                    "Paths are compared as plain text, so ~/src and ~/src2 overlap too." \
+                    "Keep only one of them in PROJECT_DIR (an outer folder already covers the inner ones) or rename a folder."
+            fi
+            j=$((j + 1))
+        done
+        i=$((i + 1))
+    done
+}
+
+check_number() {
+    case "$2" in
+        ''|*[!0-9]*) die "$1 must be a whole number, got '$2' in $CONFIG_FILE" ;;
+    esac
+}
+
+# Читает конфиг: строки КЛЮЧ=значение, пустые строки и строки с # пропускаются.
+# Файл не выполняется как скрипт (не source), поэтому код в нём не сработает.
+load_config() {
+    local line key value dir
+    [ -f "$CONFIG_FILE" ] || die "Config not found: $CONFIG_FILE" \
+        "Run scripts/install.sh from the repository: it creates the config template."
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        # Убираем пробелы по краям и возврат каретки (если файл сохранён с Windows-переводами строк).
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        case "$line" in
+            ''|'#'*) continue ;;
+        esac
+        key="${line%%=*}"
+        value="${line#*=}"
+        [ "$key" != "$line" ] || die "Bad line in $CONFIG_FILE: '$line' (expected KEY=value)"
+
+        case "$key" in
+            PROJECT_DIR)
+                # ~ или ~/ в начале пути заменяем на домашнюю папку.
+                case "$value" in
+                    '~') value="$HOME" ;;
+                    '~/'*) value="$HOME/${value#\~/}" ;;
+                esac
+                case "$value" in
+                    /*) ;;
+                    *) die "PROJECT_DIR must be an absolute path, got '$value' in $CONFIG_FILE" ;;
+                esac
+                # Двоеточие Colima считает разделителем в описании монтирования.
+                case "$value" in
+                    *:*) die "PROJECT_DIR must not contain ':', got '$value' in $CONFIG_FILE" ;;
+                esac
+                dir="$(real_dir "$value")"
+                [ -n "$dir" ] || die "PROJECT_DIR does not exist: '$value' in $CONFIG_FILE"
+                check_project_dir "$dir"
+                PROJECT_DIRS+=("$dir")
+                PROJECT_DIR_COUNT=$((PROJECT_DIR_COUNT + 1))
+                ;;
+            VM_CPU) VM_CPU="$value" ;;
+            VM_MEMORY) VM_MEMORY="$value" ;;
+            VM_DISK) VM_DISK="$value" ;;
+            BLOCK_HOST_ACCESS) BLOCK_HOST_ACCESS="$value" ;;
+            *) die "Unknown setting '$key' in $CONFIG_FILE" ;;
+        esac
+    done < "$CONFIG_FILE"
+
+    [ "$PROJECT_DIR_COUNT" -gt 0 ] || die "No PROJECT_DIR in $CONFIG_FILE." \
+        "Add at least one line with a folder where your projects live, for example:" \
+        "  PROJECT_DIR=$HOME_DIR/src" \
+        "then run: scripts/install.sh (first time) or agentcell --vm-apply"
+
+    check_number VM_CPU "$VM_CPU"
+    check_number VM_MEMORY "$VM_MEMORY"
+    check_number VM_DISK "$VM_DISK"
+    case "$BLOCK_HOST_ACCESS" in
+        0|1) ;;
+        *) die "BLOCK_HOST_ACCESS must be 0 or 1, got '$BLOCK_HOST_ACCESS' in $CONFIG_FILE" ;;
+    esac
+}
+
+# --- VM Colima (macOS) ------------------------------------------------------------
+# Поведение colima сверено с исходным кодом Colima и Lima, но на практике ещё не
+# проверено: формат `colima list`, остановка и повторный старт профиля, монтирования.
+
+# Печатает статус профиля Colima (Running, Stopped) или пустую строку, если профиля нет.
+profile_state() {
+    { colima list </dev/null 2>/dev/null || true; } | awk -v p="$1" '$1 == p { print $2 }'
+}
+
+# Запускает colima, показывая её длинный вывод только при ошибке. Стандартный ввод закрыт
+# (</dev/null): иначе colima может забрать данные из пайпа, которые нужны claude.
+colima_quiet() {
+    local log status=0
+    log="$(mktemp)"
+    colima "$@" </dev/null >"$log" 2>&1 || status=$?
+    if [ "$status" -ne 0 ]; then
+        cat "$log" >&2
+    fi
+    rm -f "$log"
+    return "$status"
+}
+
+# Описание нужных настроек VM. Сравнивается с тем, что сохранено при последнем
+# --vm-apply, чтобы заметить изменённый конфиг.
+vm_fingerprint() {
+    local dir
+    for dir in "${PROJECT_DIRS[@]}"; do
+        echo "PROJECT_DIR=$dir"
+    done
+    echo "STATE=$STATE_REAL"
+    echo "VM_CPU=$VM_CPU"
+    echo "VM_MEMORY=$VM_MEMORY"
+    echo "VM_DISK=$VM_DISK"
+    echo "BLOCK_HOST_ACCESS=$BLOCK_HOST_ACCESS"
+}
+
+vm_config_applied() {
+    [ -f "$VM_APPLIED_FILE" ] && [ "$(cat "$VM_APPLIED_FILE")" = "$(vm_fingerprint)" ]
+}
+
+# Замок на время проверки и старта VM: два одновременных запуска не должны стартовать её
+# оба (второй упал бы, пока первый ещё грузит VM). mkdir атомарна, поэтому подходит как
+# замок (команды flock в macOS нет). В замке лежит номер процесса: если он завершился, не
+# сняв замок (kill -9, перезагрузка), замок считается брошенным и забирается.
+vm_lock() {
+    local waited=0 pid
+    while ! mkdir "$VM_LOCK_DIR" 2>/dev/null; do
+        pid="$(cat "$VM_LOCK_DIR/pid" 2>/dev/null || true)"
+        if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+            rm -rf "$VM_LOCK_DIR"
+            continue
+        fi
+        if [ "$waited" -eq 0 ]; then
+            info "Another agentcell is starting the VM, waiting for it..."
+        fi
+        waited=$((waited + 1))
+        [ "$waited" -le 300 ] || die "Waited 5 minutes for another agentcell to start the VM." \
+            "If no other agentcell is running, remove the lock: rmdir $VM_LOCK_DIR"
+        sleep 1
+    done
+    echo "$$" > "$VM_LOCK_DIR/pid"
+    trap vm_unlock EXIT
+}
+
+vm_unlock() {
+    rm -rf "$VM_LOCK_DIR"
+    trap - EXIT
+}
+
+# Закрывает контейнерам доступ к хосту: к сервисам, которые слушают localhost вашего Мака
+# (локальные базы, панели, dev-серверы). Lima отдаёт хост по адресу host.lima.internal
+# (обычно 192.168.5.2); правило в цепочке DOCKER-USER отклоняет любой трафик контейнеров
+# к этому адресу. Интернет и DNS не затрагиваются: у них другие адреса. Правило не
+# переживает перезапуск VM, поэтому его ставит vm_start после каждого старта.
+# Скрипт для VM передаётся одним аргументом: Lima экранирует аргументы `colima ssh`.
+vm_block_host_access() {
+    colima ssh --profile "$VM_PROFILE" -- sh -c '
+        set -e
+        set -- $(getent hosts host.lima.internal)
+        ip="$1"
+        [ -n "$ip" ]
+        sudo iptables -C DOCKER-USER -d "$ip" -j REJECT 2>/dev/null \
+            || sudo iptables -I DOCKER-USER -d "$ip" -j REJECT
+        sudo iptables -C DOCKER-USER -d "$ip" -j REJECT
+    ' sh </dev/null >/dev/null 2>&1 \
+        || die "Could not block container access to your Mac: the firewall rule in the agentcell VM failed." \
+            "Set BLOCK_HOST_ACCESS=0 in $CONFIG_FILE and run: agentcell --vm-apply"
+}
+
+# Стартует VM. Дополнительные аргументы уходят в colima start (монтирования, ресурсы);
+# без них Colima берёт настройки, сохранённые при прошлом старте.
+# --activate=false: не делать профиль активным docker-контекстом пользователя.
+vm_start() {
+    info "Starting the agentcell VM (Colima profile '$VM_PROFILE'). The first start takes a few minutes, later ones are faster..."
+    colima_quiet start --profile "$VM_PROFILE" --activate=false "$@" \
+        || die "Failed to start the agentcell VM. See the colima output above."
+    if [ "$BLOCK_HOST_ACCESS" = "1" ]; then
+        vm_block_host_access
+    fi
+}
+
+# Главная гарантия изоляции, проверенная по факту: домашняя папка Мака в VM не видна.
+# Library есть в домашней папке любого Мака и никогда не монтируется в VM.
+# Путь передаётся отдельным аргументом ($1): Lima экранирует каждый аргумент `colima ssh`
+# по отдельности, поэтому пробелы и кавычки в пути ничего не ломают.
+# </dev/null обязателен: ssh забирает весь стандартный ввод, и данные из пайпа
+# (`cat файл | agentcell -p ...`) до claude бы не дошли.
+vm_check_home_hidden() {
+    local probe
+    probe="$(colima ssh --profile "$VM_PROFILE" -- \
+        sh -c 'if [ -d "$1/Library" ]; then echo VISIBLE; else echo HIDDEN; fi' sh "$HOME_DIR" \
+        </dev/null 2>/dev/null || true)"
+    case "$probe" in
+        *HIDDEN*) ;;
+        *VISIBLE*)
+            die "The agentcell VM can see your home folder ($HOME_DIR)." \
+                "Recreate the VM: colima delete --profile $VM_PROFILE" \
+                "then run scripts/install.sh from the repository."
+            ;;
+        *)
+            die "Could not check the agentcell VM mounts (colima ssh failed)." \
+                "Try: agentcell --vm-stop, then run agentcell again."
+            ;;
+    esac
+}
+
+# Перед обычным запуском: VM есть, настроена по конфигу и запущена.
+vm_ensure_running() {
+    local state
+    state="$(profile_state "$VM_PROFILE")"
+    [ -n "$state" ] || die "The agentcell VM does not exist." \
+        "Run scripts/install.sh from the repository."
+    vm_config_applied || die "The config was changed after the VM was set up: $CONFIG_FILE" \
+        "Apply it (the VM will restart): agentcell --vm-apply"
+    if [ "$state" != "Running" ]; then
+        vm_start
+    fi
+    vm_check_home_hidden
+}
+
+agent_sessions_running() {
+    [ -n "$(dkr ps -q --filter "ancestor=$IMAGE")" ]
+}
+
+# Есть ли в VM работающие контейнеры (например, кластеры плагинов): с VM они остановятся.
+vm_containers_running() {
+    [ -n "$(dkr ps -q)" ]
+}
+
+# agentcell --vm-apply: создать VM или привести её к конфигу.
+# Если VM уже соответствует конфигу, она не перезапускается (так повторный
+# install.sh для обновления Claude Code не трогает работающую VM).
+cmd_vm_apply() {
+    local state dir
+    local start_args=()
+    state="$(profile_state "$VM_PROFILE")"
+
+    if vm_config_applied && [ "$state" = "Running" ]; then
+        info "The agentcell VM is running and matches the config"
+        return
+    fi
+    if vm_config_applied && [ "$state" = "Stopped" ]; then
+        vm_start
+        vm_check_home_hidden
+        info "The agentcell VM is running and matches the config"
+        return
+    fi
+
+    if [ "$state" = "Running" ]; then
+        if agent_sessions_running; then
+            die "agentcell sessions are running in the VM." \
+                "Finish them and run: agentcell --vm-apply"
+        fi
+        if vm_containers_running; then
+            warn "Containers running in the VM (for example, plugin clusters) are stopped together with the VM."
+        fi
+        info "Stopping the agentcell VM to apply the config..."
+        colima_quiet stop --profile "$VM_PROFILE" || die "Failed to stop the agentcell VM. See the colima output above."
+    fi
+
+    # :w — папка доступна на запись. Хранилище монтируется всегда.
+    start_args=(--vm-type vz --mount-type virtiofs
+        --cpus "$VM_CPU" --memory "$VM_MEMORY" --disk "$VM_DISK")
+    for dir in "${PROJECT_DIRS[@]}"; do
+        start_args+=(--mount "$dir:w")
+    done
+    start_args+=(--mount "$STATE_REAL:w")
+
+    vm_start "${start_args[@]}"
+    vm_fingerprint > "$VM_APPLIED_FILE"
+    vm_check_home_hidden
+    info "The agentcell VM is ready"
+}
+
+# agentcell --vm-status: что сейчас запущено. Вывод — в stdout, это и есть ответ команды.
+cmd_vm_status() {
+    local state dir name
+    state="$(profile_state "$VM_PROFILE")"
+    echo "VM (Colima profile '$VM_PROFILE'): ${state:-not created}"
+    if vm_config_applied; then
+        echo "Config applied: yes ($CONFIG_FILE)"
+    else
+        echo "Config applied: no, run: agentcell --vm-apply"
+    fi
+    if [ "$BLOCK_HOST_ACCESS" = "1" ]; then
+        echo "Containers can reach services on your Mac: no (BLOCK_HOST_ACCESS=1)"
+    else
+        echo "Containers can reach services on your Mac: yes (BLOCK_HOST_ACCESS=0)"
+    fi
+    echo "Folders visible to the VM (from the config):"
+    for dir in "${PROJECT_DIRS[@]}"; do
+        echo "  $dir"
+    done
+    echo "  $STATE_REAL (state)"
+    # Ваша обычная Colima (профиль default) agentcell не использует; показываем её для сведения.
+    if [ "$(profile_state default)" = "Running" ]; then
+        echo "Colima profile 'default' (your other Docker): running, not used by agentcell"
+    fi
+    if [ "$state" = "Running" ]; then
+        echo "agentcell sessions:"
+        dkr ps --filter "ancestor=$IMAGE" --format '  {{.Names}}  {{.Status}}'
+    fi
+    # Установленные плагины рассказывают о себе сами.
+    load_plugins
+    for name in $PLUGIN_NAMES; do
+        "${name}_status"
+    done
+}
+
+# agentcell --vm-stop: освободить память. Работающие сессии не обрываем.
+cmd_vm_stop() {
+    if [ "$(profile_state "$VM_PROFILE")" != "Running" ]; then
+        info "The agentcell VM is not running"
+        return
+    fi
+    if agent_sessions_running; then
+        die "agentcell sessions are running in the VM." \
+            "Finish them and run: agentcell --vm-stop"
+    fi
+    colima_quiet stop --profile "$VM_PROFILE" || die "Failed to stop the agentcell VM. See the colima output above."
+    info "The agentcell VM is stopped"
+}
+
+# --- Плагины -------------------------------------------------------------------------
+# Плагин — папка ~/.config/agentcell/plugins/<имя>/ с манифестом plugin.conf и файлом
+# plugin.sh; её создаёт scripts/install.sh --with <имя>. Ядро загружает установленные
+# плагины и вызывает у каждого три функции: <имя>_check (проверка), <имя>_prepare
+# (подготовка перед запуском контейнера) и <имя>_status (строки для --vm-status).
+# Подробнее и как написать свой плагин: docs/PLUGINS.md.
+
+# Значение поля из манифеста (КЛЮЧ=значение). Нет файла или поля — пустая строка.
+manifest_get() {
+    awk -F= -v k="$2" '$1 == k { sub(/^[^=]*=/, ""); print; exit }' "$1" 2>/dev/null || true
+}
+
+# Успех, если плагин поддерживает эту систему: в поле PLATFORMS манифеста перечислены
+# macos и/или linux. Пустое поле — любая система.
+plugin_supports_platform() {
+    local platforms="$1" this=linux
+    if is_mac; then
+        this=macos
+    fi
+    [ -z "$platforms" ] && return 0
+    case " $platforms " in
+        *" $this "*) return 0 ;;
+    esac
+    return 1
+}
+
+# --- Что плагину разрешено менять в контейнере ---
+# Только сеть и переменные окружения, и только этими двумя функциями. Монтирования,
+# привилегии и прочие флаги docker плагину недоступны: на них держится изоляция.
+# Эти функции вызываются из plugin.sh, а не из ядра, поэтому здесь их вызовов нет:
+# не считайте их неиспользуемыми.
+
+plugin_add_network() {
+    DOCKER_ARGS+=(--network "$1")
+}
+
+# Передаёт переменную в контейнер: ИМЯ=значение или просто ИМЯ (значение берётся из окружения
+# хоста по имени: так передают секреты, чтобы они не попали в аргументы команды).
+plugin_add_env() {
+    local LC_ALL=C
+    local name="${1%%=*}"
+    case "$name" in
+        ''|[!A-Z_]*|*[!A-Z0-9_]*) die "A plugin tried to pass a variable with an invalid name: '$name'" ;;
+    esac
+    DOCKER_ARGS+=(-e "$1")
+}
+
+# Читает настройки плагина из ~/.config/agentcell/plugins/<плагин>/config (строки
+# КЛЮЧ=значение, как в основном конфиге). Допустимы только перечисленные ключи; значение
+# кладётся в переменную с тем же именем. Файла нет — остаются значения по умолчанию.
+# Использование: plugin_read_config <плагин> КЛЮЧ [КЛЮЧ...]
+plugin_read_config() {
+    local plugin="$1" file line key value allowed ok
+    shift
+    file="$PLUGINS_DIR/$plugin/config"
+    [ -f "$file" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        case "$line" in
+            ''|'#'*) continue ;;
+        esac
+        key="${line%%=*}"
+        value="${line#*=}"
+        [ "$key" != "$line" ] || die "Bad line in $file: '$line' (expected KEY=value)"
+        ok=0
+        for allowed in "$@"; do
+            if [ "$allowed" = "$key" ]; then
+                ok=1
+            fi
+        done
+        [ "$ok" = "1" ] || die "Unknown setting '$key' in $file"
+        eval "$key=\$value"
+    done < "$file"
+}
+
+# Загружает установленные плагины. Плагин на неподходящей системе пропускается;
+# несовместимые плагины вместе не работают (поле CONFLICTS манифеста).
+load_plugins() {
+    local dir name hook other platforms conflicts
+    PLUGIN_NAMES=""
+    for dir in "$PLUGINS_DIR"/*/; do
+        [ -f "${dir}plugin.sh" ] || continue
+        name="$(basename "$dir")"
+        case "$name" in
+            ''|*[!a-z0-9]*)
+                warn "Skipping plugin folder '$name': the name may contain only a-z and 0-9."
+                continue
+                ;;
+        esac
+        platforms="$(manifest_get "${dir}plugin.conf" PLATFORMS)"
+        if plugin_supports_platform "$platforms"; then
+            PLUGIN_NAMES="$PLUGIN_NAMES $name"
+        else
+            warn "Plugin '$name' supports only: $platforms. Skipping it on this system."
+        fi
+    done
+
+    for name in $PLUGIN_NAMES; do
+        conflicts="$(manifest_get "$PLUGINS_DIR/$name/plugin.conf" CONFLICTS)"
+        for other in $conflicts; do
+            case " $PLUGIN_NAMES " in
+                *" $other "*)
+                    die "Plugins '$name' and '$other' cannot be used together." \
+                        "Remove one of them: ./scripts/install.sh --without $other"
+                    ;;
+            esac
+        done
+    done
+
+    for name in $PLUGIN_NAMES; do
+        # shellcheck disable=SC1090
+        . "$PLUGINS_DIR/$name/plugin.sh"
+        for hook in check prepare status; do
+            declare -F "${name}_$hook" >/dev/null \
+                || die "Plugin '$name' does not define ${name}_$hook ($PLUGINS_DIR/$name/plugin.sh)."
+        done
+    done
+}
+
+# Сначала проверки всех плагинов (они ничего не меняют), потом подготовка.
+run_plugin_hooks() {
+    local name
+    for name in $PLUGIN_NAMES; do
+        "${name}_check"
+    done
+    for name in $PLUGIN_NAMES; do
+        "${name}_prepare"
+    done
 }
 
 # --- Проверки перед запуском -------------------------------------------------
 
-if ! docker info >/dev/null 2>&1; then
-    if [ "$(uname -s)" = "Darwin" ]; then
-        die "Docker is not available. Start it with: colima start"
-    else
+HOME_DIR="$(cd "$HOME" && pwd -P)"
+HOME_PARENT="$(dirname "$HOME_DIR")"
+CURRENT_DIR="$(pwd -P)"
+
+# Папка хранилища хранит токен входа, поэтому закрываем её от других пользователей.
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR" 2>/dev/null || true
+STATE_REAL="$(real_dir "$STATE_DIR")"
+
+if is_mac; then
+    command -v colima >/dev/null 2>&1 || die "Colima is not installed. Install it: brew install colima docker"
+    command -v docker >/dev/null 2>&1 || die "Docker CLI is not installed. Install it: brew install docker"
+
+    # Остановка не требует конфига: VM можно погасить, даже если конфиг сломан.
+    if [ "${1:-}" = "--vm-stop" ]; then
+        cmd_vm_stop
+        exit 0
+    fi
+
+    load_config
+
+    # Хранилище тоже монтируется в VM: проверяем его, как папки проектов. Конфиг не
+    # должен оказаться внутри хранилища, иначе агент смог бы его менять.
+    check_vm_mount "$STATE_REAL"
+    if is_inside "$(real_dir "$CONFIG_DIR")" "$STATE_REAL"; then
+        die "AGENTCELL_STATE ($STATE_REAL) must not contain $CONFIG_DIR."
+    fi
+    check_no_overlap
+
+    case "${1:-}" in
+        --vm-apply)
+            vm_lock
+            cmd_vm_apply
+            vm_unlock
+            exit 0
+            ;;
+        --vm-status)
+            cmd_vm_status
+            exit 0
+            ;;
+    esac
+
+    vm_lock
+    vm_ensure_running
+    vm_unlock
+else
+    case "${1:-}" in
+        --vm-status|--vm-stop|--vm-apply)
+            die "$1 works only on macOS: on Linux Docker runs directly on the host, without a VM."
+            ;;
+    esac
+
+    if ! docker info >/dev/null 2>&1; then
         die "Docker is not available. Check that the daemon is running and your user is in the 'docker' group."
     fi
 fi
 
-docker image inspect "$IMAGE" >/dev/null 2>&1 \
+dkr image inspect "$IMAGE" >/dev/null 2>&1 \
     || die "Image '$IMAGE' not found. Run scripts/install.sh from the repository first."
 
-# Главный риск идеи «виден только проект» — запуск не из той папки. Из домашней
-# папки или из корня контейнер увидел бы почти всё, поэтому по умолчанию отказываем.
-PROJECT_DIR="$(pwd -P)"
-HOME_DIR="$(cd "$HOME" && pwd -P)"
-if [ "${AGENTCELL_ALLOW_ANY_DIR:-0}" != "1" ]; then
-    if [ "$PROJECT_DIR" = "/" ] || [ "$PROJECT_DIR" = "$HOME_DIR" ]; then
-        die "Refusing to mount '$PROJECT_DIR': it is too wide. cd into a project folder or set AGENTCELL_ALLOW_ANY_DIR=1."
+# Главный риск идеи «виден только проект» — запуск не из той папки.
+if is_mac; then
+    # VM видит только папки из конфига: из другой папки контейнер получил бы пустой проект.
+    inside_project_dir=0
+    at_project_dir_root=0
+    for dir in "${PROJECT_DIRS[@]}"; do
+        if is_inside "$CURRENT_DIR" "$dir"; then
+            inside_project_dir=1
+        fi
+        if [ "$CURRENT_DIR" = "$dir" ]; then
+            at_project_dir_root=1
+        fi
+    done
+    if [ "$inside_project_dir" != "1" ]; then
+        die "Folder '$CURRENT_DIR' is not inside any PROJECT_DIR, so the agentcell VM cannot see it." \
+            "Add a line to $CONFIG_FILE:" \
+            "  PROJECT_DIR=$CURRENT_DIR" \
+            "then run: agentcell --vm-apply"
+    fi
+    # Из корня папки проектов агент увидит все проекты в ней, а не один.
+    if [ "$at_project_dir_root" = "1" ] && [ ! -e "$CURRENT_DIR/.git" ]; then
+        warn "'$CURRENT_DIR' is a PROJECT_DIR root without .git: the agent will see every folder inside it."
+        warn "To work on a single project, cd into that project first."
+    fi
+else
+    # Из домашней папки или из корня контейнер увидел бы почти всё, поэтому по умолчанию отказываем.
+    if [ "${AGENTCELL_ALLOW_ANY_DIR:-0}" != "1" ]; then
+        if [ "$CURRENT_DIR" = "/" ] || [ "$CURRENT_DIR" = "$HOME_DIR" ]; then
+            die "Refusing to mount '$CURRENT_DIR': it is too wide. cd into a project folder or set AGENTCELL_ALLOW_ANY_DIR=1."
+        fi
     fi
 fi
 
 # --- Сборка команды docker run -----------------------------------------------
 
-# Папка хранилища хранит токен входа, поэтому закрываем её от других пользователей.
-mkdir -p "$STATE_DIR"
-chmod 700 "$STATE_DIR" 2>/dev/null || true
-
 # Базовые флаги:
-#   --rm     после выхода контейнер пропадает, а данные остаются только в хранилище
-#   --init   не даёт копиться «зависшим» дочерним процессам в долгих запусках
-DOCKER_ARGS=(run --rm --init)
+#   --context  только macOS: команда уходит в VM agentcell
+#   --rm       после выхода контейнер пропадает, а данные остаются только в хранилище
+#   --init     не даёт копиться «зависшим» дочерним процессам в долгих запусках
+if is_mac; then
+    DOCKER_ARGS=(--context "$DOCKER_CONTEXT_NAME" run --rm --init)
+else
+    DOCKER_ARGS=(run --rm --init)
+fi
 
 # Терминал подключаем только если он есть (иначе запуск из cron или пайпа упадёт).
 if [ -t 0 ] && [ -t 1 ]; then
@@ -76,8 +745,8 @@ DOCKER_ARGS+=(
     --user "$(id -u):$(id -g)"
     --cap-drop=ALL
     --security-opt no-new-privileges
-    -v "$STATE_DIR:$CELL_HOME"
-    -v "$PROJECT_DIR:$CELL_WORKDIR" -w "$CELL_WORKDIR"
+    -v "$STATE_REAL:$CELL_HOME"
+    -v "$CURRENT_DIR:$CELL_WORKDIR" -w "$CELL_WORKDIR"
     -e "HOME=$CELL_HOME"
 )
 
@@ -86,6 +755,10 @@ DOCKER_ARGS+=(
 if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
     DOCKER_ARGS+=(-e ANTHROPIC_API_KEY)
 fi
+
+# Плагины: проверка и подготовка. Без включающих переменных плагины ничего не делают.
+load_plugins
+run_plugin_hooks
 
 # Режим --shell: вместо claude запускаем bash в том же контейнере.
 if [ "${1:-}" = "--shell" ]; then
