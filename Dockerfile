@@ -23,11 +23,16 @@ ARG KUBECTL_VERSION=v1.37.2
 
 # Архитектуру (amd64 или arm64) берём у самой системы образа: так сборка не зависит
 # от того, есть ли у docker BuildKit. Скачанный файл сверяем с контрольной суммой.
+#
+# У curl есть защита от зависания: если скорость почти нулевая 30 секунд, передача
+# обрывается и начинается заново (до 5 раз). Без этого медленная сеть могла подвесить
+# сборку образа навсегда.
 RUN if [ "$WITH_KUBECTL" = "1" ]; then \
-        ARCH="$(dpkg --print-architecture)" \
+        CURL="curl -fsSL --connect-timeout 30 --speed-limit 10000 --speed-time 30 --retry 5 --retry-all-errors" \
+        && ARCH="$(dpkg --print-architecture)" \
         && URL="https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl" \
-        && curl -fsSL -o /usr/local/bin/kubectl "$URL" \
-        && echo "$(curl -fsSL "$URL.sha256")  /usr/local/bin/kubectl" | sha256sum -c - \
+        && $CURL -o /usr/local/bin/kubectl "$URL" \
+        && echo "$($CURL "$URL.sha256")  /usr/local/bin/kubectl" | sha256sum -c - \
         && chmod 755 /usr/local/bin/kubectl; \
     fi
 
