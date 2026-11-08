@@ -10,6 +10,35 @@
 # RUN apt-get update && apt-get install -y <пакет> перед установкой Claude Code.
 FROM node:24
 
+# kubectl нужен только плагину kind и ставится, только если WITH_KUBECTL=1. Это передаёт
+# scripts/install.sh из манифеста установленного плагина (./scripts/install.sh --with kind).
+# Без плагина образ остаётся без kubectl.
+ARG WITH_KUBECTL=0
+
+# Версия закреплена, чтобы не «уезжать» при пересборке. Она должна быть не дальше
+# ±1 минорной версии от Kubernetes в ноде kind: kind по умолчанию создаёт ноду самой
+# свежей версии, а если ваш кластер старше, поменяйте версию kubectl.
+# Поменять без правки файла: KUBECTL_VERSION=v1.xx.y ./scripts/install.sh --with kind
+ARG KUBECTL_VERSION=v1.37.2
+
+# Архитектуру (amd64 или arm64) берём у самой системы образа: так сборка не зависит
+# от того, есть ли у docker BuildKit. Скачанный файл сверяем с контрольной суммой.
+#
+# У curl есть защита от зависания: если скорость почти нулевая 30 секунд, передача
+# обрывается и начинается заново (до 5 раз). Без этого медленная сеть могла подвесить
+# сборку образа навсегда.
+RUN if [ "$WITH_KUBECTL" = "1" ]; then \
+        CURL="curl -fsSL --connect-timeout 30 --speed-limit 10000 --speed-time 30 --retry 5 --retry-all-errors" \
+        && ARCH="$(dpkg --print-architecture)" \
+        && URL="https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl" \
+        && $CURL -o /usr/local/bin/kubectl "$URL" \
+        && echo "$($CURL "$URL.sha256")  /usr/local/bin/kubectl" | sha256sum -c - \
+        && chmod 755 /usr/local/bin/kubectl; \
+    fi
+
+# Метка сообщает плагину, что kubectl в образе есть: плагин проверяет её перед запуском.
+LABEL agentcell.kubectl="${WITH_KUBECTL}"
+
 # Версию можно закрепить: --build-arg CLAUDE_CODE_VERSION=x.y.z
 ARG CLAUDE_CODE_VERSION=latest
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
