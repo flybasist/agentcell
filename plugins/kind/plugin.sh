@@ -36,6 +36,7 @@ kind_check() {
 # Подготовка: права агента в кластере, токен, kubeconfig, сеть и переменная для контейнера.
 kind_prepare() {
     [ -n "${AGENTCELL_KIND_CLUSTER:-}" ] || return 0
+    kind_wait_ready
     kind_apply_rbac
     kind_apply_admin_mode
     kind_write_kubeconfig
@@ -87,7 +88,7 @@ kind_node_kubectl() {
 }
 
 # То же, но манифест подаётся через stdin (kubectl apply -f -).
-kind_kind_node_kubectl_stdin() {
+kind_node_kubectl_stdin() {
     dkr exec -i "$KIND_NODE" kubectl --kubeconfig=/etc/kubernetes/admin.conf "$@"
 }
 
@@ -119,12 +120,34 @@ kind_check_cluster() {
     [ -n "$KIND_NETWORK" ] || die "Could not find the docker network of '$KIND_NODE'."
 }
 
+# Ждём, пока кластер будет готов принимать права. Сразу после `kind create cluster` или
+# после старта VM контейнер ноды уже работает, но API может ещё не отвечать, а встроенная
+# роль admin сначала пустая: Kubernetes наполняет её правилами чуть позже (агрегированная
+# роль). Пока правил нет, привязка к admin ничего не разрешает. Поэтому ждём, пока в роли
+# admin появятся правила. Ждём до 90 секунд.
+kind_wait_ready() {
+    local attempt rules
+    for attempt in $(seq 1 45); do
+        rules="$(kind_node_kubectl get clusterrole admin -o 'jsonpath={.rules[*].resources[*]}' 2>/dev/null || true)"
+        if [ -n "$rules" ]; then
+            return 0
+        fi
+        if [ "$attempt" -eq 1 ]; then
+            info "Waiting for kind cluster '$KIND_CLUSTER' to become ready (up to 90 seconds)..."
+        fi
+        sleep 2
+    done
+    die "kind cluster '$KIND_CLUSTER' did not become ready in 90 seconds." \
+        "Check it: docker --context $DOCKER_CONTEXT_NAME logs $KIND_NODE" \
+        "Then run agentcell again."
+}
+
 # Namespace агента, его ServiceAccount и права. Повторное применение ничего не ломает.
 # PSA baseline запрещает привилегированные поды, hostPath, hostPID и hostNetwork —
 # всё, через что под может выбраться в ноду, а из неё в VM.
 kind_apply_rbac() {
     info "Preparing agent access to kind cluster '$KIND_CLUSTER'..."
-    kind_kind_node_kubectl_stdin apply -f - >/dev/null <<EOF
+    kind_node_kubectl_stdin apply -f - >/dev/null <<EOF
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -192,7 +215,7 @@ EOF
 # AGENTCELL_KIND_ADMIN=1, снимет права и у неё.
 kind_apply_admin_mode() {
     if [ "${AGENTCELL_KIND_ADMIN:-0}" = "1" ]; then
-        kind_kind_node_kubectl_stdin apply -f - >/dev/null <<EOF
+        kind_node_kubectl_stdin apply -f - >/dev/null <<EOF
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:

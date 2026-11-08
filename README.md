@@ -25,6 +25,8 @@
 ## Что нужно
 
 - macOS 13+ (Colima и Docker CLI) или Linux с Docker (рассчитано на Debian 13).
+  **Linux в версии v0.2.0 не проверялся:** проверка запланирована, до неё работа на Linux
+  не гарантируется. Основная платформа — macOS.
 - Аккаунт Claude с подпиской Pro/Max или API-ключ из Anthropic Console.
 
 ## Установка и запуск
@@ -36,6 +38,11 @@ agentcell                 # интерактивная сессия Claude Code
 ```
 
 Повторный запуск `./scripts/install.sh` обновляет Claude Code.
+
+**Если у вас уже стоит v0.1.0 (macOS):** `git pull`, затем `./scripts/install.sh`. Он
+создаст конфиг и остановится: впишите в него `PROJECT_DIR` (папки с проектами) и запустите
+установку снова. Вход в аккаунт сохранится. Подробно: [docs/QUICKSTART.md](docs/QUICKSTART.md),
+раздел 8.
 
 Другие режимы:
 

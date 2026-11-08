@@ -98,8 +98,10 @@ DOCKER_CONTEXT=colima-agentcell kind delete cluster --name lab \
 1. `kind_check` проверяет имя кластера (только `a-z`, `0-9`, `-`), срок токена, что образ
    собран с kubectl, что нода `lab-control-plane` запущена и помечена как нода кластера
    `lab`. Сеть берёт у этой ноды (обычно `kind`).
-2. `kind_prepare` через `docker exec` в ноду (там есть kubectl и `admin.conf`) применяет
-   манифест:
+2. `kind_prepare` сначала ждёт готовности кластера (до 90 секунд): сразу после
+   `kind create cluster` и после старта VM встроенная роль `admin` ещё пустая, и права на
+   неё не сработали бы. Затем через `docker exec` в ноду (там есть kubectl и `admin.conf`)
+   применяет манифест:
    - namespace `agent` с Pod Security `enforce=baseline`, `warn/audit=restricted`;
    - ServiceAccount `agent/agentcell`;
    - RoleBinding на встроенную роль `admin` в namespace `agent`;
@@ -151,5 +153,6 @@ DOCKER_CONTEXT=colima-agentcell kind delete cluster --name lab \
 | `KIND_TOKEN_TTL must look like 8h or 90m` | Исправьте значение в `~/.config/agentcell/plugins/kind/config`. |
 | `Unknown setting` / `Bad line` в файле настроек | В `config` допустим только ключ `KIND_TOKEN_TTL`, формат `КЛЮЧ=значение`. |
 | `kubectl`: `Unauthorized` | Истёк токен или кластер пересоздан. Перезапустите `agentcell`. |
+| `kind cluster '...' did not become ready in 90 seconds` | Кластер не поднялся: `docker --context colima-agentcell logs <кластер>-control-plane`, затем запустите `agentcell` снова. |
 | `Plugin 'kind' supports only: macos` | Плагин работает только на macOS. |
 | `AGENTCELL_KIND_ADMIN is ignored` | Админский режим работает только вместе с `AGENTCELL_KIND_CLUSTER`. |
